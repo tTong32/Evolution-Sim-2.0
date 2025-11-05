@@ -3,8 +3,14 @@ mod utils;
 
 use bevy::prelude::*;
 use world::WorldPlugin;
+use tracing_subscriber::EnvFilter;
 
 fn main() {
+    // Initialize tracing subscriber for better error visibility
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+    
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
