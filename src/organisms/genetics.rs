@@ -213,6 +213,16 @@ pub mod traits {
     pub fn express_sensory_range(genome: &Genome) -> f32 {
         express_trait(genome, SENSORY_RANGE, 5.0, 50.0)
     }
+    
+    /// Express aggression trait (for behavior decisions)
+    pub fn express_aggression(genome: &Genome) -> f32 {
+        express_trait(genome, AGGRESSION, 0.0, 1.0)
+    }
+    
+    /// Express boldness trait (for behavior decisions)
+    pub fn express_boldness(genome: &Genome) -> f32 {
+        express_trait(genome, BOLDNESS, 0.0, 1.0)
+    }
 }
 
 /// Default mutation rate (probability of mutation per gene)

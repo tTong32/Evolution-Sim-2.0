@@ -10,7 +10,7 @@ use bevy::time::Time;
 
 pub use chunk::Chunk;
 pub use cell::Cell;
-pub use cell::TerrainType;
+pub use cell::{TerrainType, ResourceType};
 pub use grid::WorldGrid;
 pub use climate::ClimateState;
 pub use resources::*;

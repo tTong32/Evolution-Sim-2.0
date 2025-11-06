@@ -1,7 +1,8 @@
 use bevy::prelude::*;
 use crate::organisms::components::*;
 use crate::organisms::genetics::{Genome, traits, DEFAULT_MUTATION_RATE};
-use crate::world::WorldGrid;
+use crate::organisms::behavior::*;
+use crate::world::{WorldGrid, ResourceType};
 use rand::Rng;
 
 use std::fs::{File, OpenOptions};
@@ -96,6 +97,7 @@ pub fn spawn_initial_organisms(
             genome,
             SpeciesId::new(0), // All start as same species for now
             organism_type,
+            Behavior::new(),
             Alive,
         )).id();
         
@@ -157,80 +159,182 @@ pub fn update_metabolism(
     }
 }
 
-/// Update organism movement (simple wandering behavior)
-/// Uses speed trait from genome if available
+/// Update behavior decisions based on sensory input and organism state
+pub fn update_behavior(
+    mut query: Query<(
+        Entity,
+        &Position,
+        &mut Behavior,
+        &Energy,
+        &Genome,
+        &SpeciesId,
+        &OrganismType,
+        &Size,
+    ), With<Alive>>,
+    world_grid: Res<WorldGrid>,
+    organism_query: Query<(Entity, &Position, &SpeciesId, &OrganismType, &Size, &Energy), With<Alive>>,
+    time: Res<Time>,
+) {
+    let dt = time.delta_seconds();
+    
+    for (entity, position, mut behavior, energy, genome, species_id, organism_type, size) in query.iter_mut() {
+        // Update state time
+        behavior.state_time += dt;
+        
+        // Get sensory range from genome
+        let sensory_range = traits::express_sensory_range(genome);
+        
+        // Collect sensory data
+        let sensory = collect_sensory_data(
+            entity,
+            position.0,
+            sensory_range,
+            *species_id,
+            *organism_type,
+            size.value(),
+            &world_grid,
+            &organism_query,
+        );
+        
+        // Make behavior decision
+        let (new_state, target_entity, target_position) = decide_behavior(
+            energy,
+            genome,
+            *organism_type,
+            &sensory,
+            behavior.state,
+            behavior.state_time,
+        );
+        
+        // Update behavior state
+        behavior.set_state(new_state);
+        behavior.target_entity = target_entity;
+        behavior.target_position = target_position;
+    }
+}
+
+/// Update organism movement based on behavior state
 pub fn update_movement(
-    mut query: Query<(&mut Position, &mut Velocity, &Energy, &Size, Option<&Genome>, Entity)>,
+    mut query: Query<(
+        &mut Position, 
+        &mut Velocity, 
+        &Behavior,
+        &Energy, 
+        &Size, 
+        &Genome,
+        &OrganismType,
+        Entity
+    ), With<Alive>>,
     time: Res<Time>,
     tracked: ResMut<TrackedOrganism>,
 ) {
     let dt = time.delta_seconds();
-    let mut rng = rand::thread_rng();
-    let mut direction_changed = false;
+    let time_elapsed = time.elapsed_seconds();
     
-    for (mut position, mut velocity, energy, size, genome_opt, entity) in query.iter_mut() {
-        // Skip if dead or very low energy
-        if energy.is_dead() || energy.ratio() < 0.1 {
+    for (mut position, mut velocity, behavior, energy, _size, genome, organism_type, entity) in query.iter_mut() {
+        // Skip if dead
+        if energy.is_dead() {
             velocity.0 = Vec2::ZERO;
-            if tracked.entity == Some(entity) {
-                info!("[TRACKED] Organism stopped moving (low energy: {:.2}%)", energy.ratio() * 100.0);
-            }
             continue;
         }
         
-        // Get max speed from genome or default based on size
-        let max_speed = if let Some(genome) = genome_opt {
-            traits::express_speed(genome)
-        } else {
-            // Fallback: larger organisms move slower
-            20.0 / size.value().max(0.5)
-        };
+        // Calculate velocity based on behavior state
+        let desired_velocity = calculate_behavior_velocity(
+            behavior,
+            position.0,
+            genome,
+            *organism_type,
+            energy,
+            time_elapsed,
+        );
         
-        // Simple wandering behavior: random walk with momentum
-        // Occasionally add random velocity changes
-        if rng.gen_bool(0.05) { // 5% chance per frame to change direction
-            let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-            let speed = rng.gen_range(max_speed * 0.3..max_speed * 0.7);
-            velocity.0 = Vec2::from_angle(angle) * speed;
-            
-            if tracked.entity == Some(entity) {
-                direction_changed = true;
-            }
-        }
+        // Smooth velocity transitions (lerp for smoother movement)
+        let lerp_factor = 0.3; // How quickly velocity changes
+        velocity.0 = velocity.0.lerp(desired_velocity, lerp_factor);
         
-        // Apply velocity damping (friction)
-        velocity.0 *= 0.95;
-        
-        // Clamp velocity to max speed
-        if velocity.0.length() > max_speed {
-            velocity.0 = velocity.0.normalize() * max_speed;
+        // Apply velocity damping (friction) for wandering/resting
+        if behavior.state == BehaviorState::Wandering || behavior.state == BehaviorState::Resting {
+            velocity.0 *= 0.98;
         }
         
         // Update position
-        let old_position = position.0;
         position.0 += velocity.0 * dt;
         
         // Simple boundary checking (keep organisms within reasonable bounds)
-        // In future, this will wrap or use proper world boundaries
         let max_pos = 200.0;
-        let hit_boundary = position.0.x != old_position.x + velocity.0.x * dt || 
-                          position.0.y != old_position.y + velocity.0.y * dt;
         position.0.x = position.0.x.clamp(-max_pos, max_pos);
         position.0.y = position.0.y.clamp(-max_pos, max_pos);
         
-        if tracked.entity == Some(entity) && hit_boundary {
-            info!("[TRACKED] Organism hit world boundary at ({:.2}, {:.2})", position.0.x, position.0.y);
+        if tracked.entity == Some(entity) && behavior.state_time < dt * 2.0 {
+            // Log behavior changes
+            info!("[TRACKED] Behavior: {:?}, Velocity: ({:.2}, {:.2}), Speed: {:.2}", 
+                  behavior.state, velocity.0.x, velocity.0.y, velocity.0.length());
         }
     }
+}
+
+/// Handle eating behavior - consume resources or prey
+pub fn handle_eating(
+    mut query: Query<(
+        Entity,
+        &Position,
+        &mut Energy,
+        &Behavior,
+        &OrganismType,
+        &Size,
+    ), With<Alive>>,
+    mut world_grid: ResMut<WorldGrid>,
+    _organism_query: Query<(&Position, &mut Energy, &Size), (With<Alive>, Without<Behavior>)>,
+    time: Res<Time>,
+) {
+    let dt = time.delta_seconds();
+    let consumption_rate = 5.0; // Resources consumed per second
+    let energy_conversion_efficiency = 0.3; // 30% of consumed resources -> energy
     
-    // Log direction change if it happened
-    if direction_changed {
-        if let Some(entity) = tracked.entity {
-            if let Ok((_position, velocity, _energy, _size, _genome, _entity)) = query.get(entity) {
-                info!("[TRACKED] Direction changed - New velocity: ({:.2}, {:.2}), Speed: {:.2}", 
-                      velocity.0.x, velocity.0.y, velocity.0.length());
-            }
+    for (_entity, position, mut energy, behavior, organism_type, _size) in query.iter_mut() {
+        if behavior.state != BehaviorState::Eating {
+            continue;
         }
+        
+        // Get current cell
+        if let Some(cell) = world_grid.get_cell_mut(position.x(), position.y()) {
+            let consumed = match organism_type {
+                OrganismType::Producer => {
+                    // Producers consume sunlight, water, minerals
+                    let sunlight = cell.get_resource(ResourceType::Sunlight).min(consumption_rate * dt);
+                    let water = cell.get_resource(ResourceType::Water).min(consumption_rate * dt * 0.5);
+                    let mineral = cell.get_resource(ResourceType::Mineral).min(consumption_rate * dt * 0.2);
+                    
+                    cell.set_resource(ResourceType::Sunlight, cell.get_resource(ResourceType::Sunlight) - sunlight);
+                    cell.set_resource(ResourceType::Water, cell.get_resource(ResourceType::Water) - water);
+                    cell.set_resource(ResourceType::Mineral, cell.get_resource(ResourceType::Mineral) - mineral);
+                    
+                    (sunlight + water + mineral) * energy_conversion_efficiency
+                }
+                OrganismType::Consumer => {
+                    // Consumers consume plants or prey resources
+                    let plant = cell.get_resource(ResourceType::Plant).min(consumption_rate * dt);
+                    let prey_resource = cell.get_resource(ResourceType::Prey).min(consumption_rate * dt);
+                    
+                    cell.set_resource(ResourceType::Plant, cell.get_resource(ResourceType::Plant) - plant);
+                    cell.set_resource(ResourceType::Prey, cell.get_resource(ResourceType::Prey) - prey_resource);
+                    
+                    (plant + prey_resource * 2.0) * energy_conversion_efficiency // Prey is more nutritious
+                }
+                OrganismType::Decomposer => {
+                    // Decomposers consume detritus
+                    let detritus = cell.get_resource(ResourceType::Detritus).min(consumption_rate * dt);
+                    
+                    cell.set_resource(ResourceType::Detritus, cell.get_resource(ResourceType::Detritus) - detritus);
+                    
+                    detritus * energy_conversion_efficiency * 0.5 // Less efficient
+                }
+            };
+            
+            // Add energy (clamped to max)
+            energy.current = (energy.current + consumed).min(energy.max);
+        }
+        
     }
 }
 
@@ -345,6 +449,7 @@ pub fn handle_reproduction(
                 offspring_genome,
                 species_id, // Inherit species ID
                 org_type,
+                Behavior::new(),
                 Alive,
             ));
             
@@ -380,7 +485,7 @@ pub fn handle_death(
 /// Log tracked organism information periodically
 pub fn log_tracked_organism(
     tracked: ResMut<TrackedOrganism>,
-    query: Query<(Entity, &Position, &Velocity, &Energy, &Age, &Size, &OrganismType), With<Alive>>,
+    query: Query<(Entity, &Position, &Velocity, &Energy, &Age, &Size, &OrganismType, &Behavior, &Genome), With<Alive>>,
 ) {
     let mut tracked_mut = tracked;
     tracked_mut.log_counter += 1;
@@ -391,19 +496,23 @@ pub fn log_tracked_organism(
     }
     
     if let Some(entity) = tracked_mut.entity {
-        if let Ok((_entity, position, velocity, energy, age, size, org_type)) = query.get(entity) {
+        if let Ok((_entity, position, velocity, energy, age, size, org_type, behavior, genome)) = query.get(entity) {
             let speed = velocity.0.length();
-            let action = if speed < 0.1 {
-                "Resting"
-            } else if speed > 10.0 {
-                "Moving Fast"
+            let behavior_state = format!("{:?}", behavior.state);
+            let sensory_range = traits::express_sensory_range(genome);
+            let aggression = traits::express_aggression(genome);
+            let boldness = traits::express_boldness(genome);
+            
+            // Format target information
+            let target_info = if let Some(target_pos) = behavior.target_position {
+                format!("({:.1}, {:.1})", target_pos.x, target_pos.y)
             } else {
-                "Wandering"
+                "None".to_string()
             };
             
             // Console logging
             info!(
-                "[TRACKED ORGANISM] Tick: {} | Pos: ({:.2}, {:.2}) | Vel: ({:.2}, {:.2}) | Speed: {:.2} | Energy: {:.2}/{:.2} ({:.1}%) | Age: {} | Size: {:.2} | Type: {:?} | Action: {}",
+                "[TRACKED ORGANISM] Tick: {} | Pos: ({:.2}, {:.2}) | Vel: ({:.2}, {:.2}) | Speed: {:.2} | Energy: {:.2}/{:.2} ({:.1}%) | Age: {} | Size: {:.2} | Type: {:?} | Behavior: {} | StateTime: {:.1}s | Target: {} | SensoryRange: {:.1} | Aggression: {:.2} | Boldness: {:.2}",
                 tracked_mut.log_counter,
                 position.0.x,
                 position.0.y,
@@ -416,7 +525,12 @@ pub fn log_tracked_organism(
                 age.0,
                 size.value(),
                 org_type,
-                action
+                behavior_state,
+                behavior.state_time,
+                target_info,
+                sensory_range,
+                aggression,
+                boldness
             );
             
             // CSV logging
@@ -428,15 +542,22 @@ pub fn log_tracked_organism(
                 if needs_header {
                     writeln!(
                         writer,
-                        "tick,position_x,position_y,velocity_x,velocity_y,speed,energy_current,energy_max,energy_ratio,age,size,organism_type,action"
+                        "tick,position_x,position_y,velocity_x,velocity_y,speed,energy_current,energy_max,energy_ratio,age,size,organism_type,behavior_state,state_time,target_x,target_y,target_entity,sensory_range,aggression,boldness"
                     ).expect("Failed to write CSV header");
                     writer.flush().expect("Failed to flush CSV writer");
                 }
                 
+                // Extract target coordinates
+                let (target_x, target_y) = if let Some(target_pos) = behavior.target_position {
+                    (target_pos.x, target_pos.y)
+                } else {
+                    (f32::NAN, f32::NAN)
+                };
+                
                 // Write data row
                 writeln!(
                     writer,
-                    "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:?},{}",
+                    "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:?},{},{:.6},{:.6},{:.6},{:?},{:.6},{:.6},{:.6}",
                     tick,
                     position.0.x,
                     position.0.y,
@@ -449,7 +570,14 @@ pub fn log_tracked_organism(
                     age.0,
                     size.value(),
                     org_type,
-                    action
+                    behavior_state,
+                    behavior.state_time,
+                    target_x,
+                    target_y,
+                    behavior.target_entity,
+                    sensory_range,
+                    aggression,
+                    boldness
                 ).expect("Failed to write CSV row");
                 
                 writer.flush().expect("Failed to flush CSV writer");
