@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use crate::organisms::components::*;
+use crate::organisms::genetics::{Genome, traits, DEFAULT_MUTATION_RATE};
 use crate::world::WorldGrid;
 use rand::Rng;
 
@@ -64,9 +65,16 @@ pub fn spawn_initial_organisms(
         let x = rng.gen_range(-spawn_range..spawn_range);
         let y = rng.gen_range(-spawn_range..spawn_range);
         
-        // Random organism properties
-        let max_energy = rng.gen_range(50.0..100.0);
-        let size = rng.gen_range(0.5..2.0);
+        // Create random genome for this organism
+        let genome = Genome::random();
+        
+        // Express traits from genome
+        let size = traits::express_size(&genome);
+        let max_energy = traits::express_max_energy(&genome);
+        let metabolism_rate = traits::express_metabolism_rate(&genome);
+        let movement_cost = traits::express_movement_cost(&genome);
+        let reproduction_cooldown = traits::express_reproduction_cooldown(&genome) as u32;
+        
         let organism_type = match rng.gen_range(0..3) {
             0 => OrganismType::Producer,
             1 => OrganismType::Consumer,
@@ -83,7 +91,9 @@ pub fn spawn_initial_organisms(
             Energy::new(max_energy),
             Age::new(),
             Size::new(size),
-            Metabolism::default(),
+            Metabolism::new(metabolism_rate, movement_cost),
+            ReproductionCooldown::new(reproduction_cooldown),
+            genome,
             SpeciesId::new(0), // All start as same species for now
             organism_type,
             Alive,
@@ -116,19 +126,27 @@ pub fn spawn_initial_organisms(
 }
 
 /// Update metabolism - organisms consume energy over time
+/// Uses traits from genome (if available) or falls back to Metabolism component
 pub fn update_metabolism(
-    mut query: Query<(&mut Energy, &Velocity, &Metabolism, &Size)>,
+    mut query: Query<(&mut Energy, &Velocity, &Metabolism, &Size, Option<&Genome>)>,
     time: Res<Time>,
 ) {
     let dt = time.delta_seconds();
     
-    for (mut energy, velocity, metabolism, size) in query.iter_mut() {
+    for (mut energy, velocity, metabolism, size, genome_opt) in query.iter_mut() {
+        // Use genome traits if available, otherwise use Metabolism component
+        let (base_rate, movement_cost_mult) = if let Some(genome) = genome_opt {
+            (traits::express_metabolism_rate(genome), traits::express_movement_cost(genome))
+        } else {
+            (metabolism.base_rate, metabolism.movement_cost)
+        };
+        
         // Base metabolic cost (proportional to size)
-        let base_cost = metabolism.base_rate * size.value() * dt;
+        let base_cost = base_rate * size.value() * dt;
         
         // Movement cost (proportional to speed)
         let speed = velocity.0.length();
-        let movement_cost = speed * metabolism.movement_cost * dt;
+        let movement_cost = speed * movement_cost_mult * dt;
         
         // Total energy consumed
         let total_cost = base_cost + movement_cost;
@@ -140,8 +158,9 @@ pub fn update_metabolism(
 }
 
 /// Update organism movement (simple wandering behavior)
+/// Uses speed trait from genome if available
 pub fn update_movement(
-    mut query: Query<(&mut Position, &mut Velocity, &Energy, &Size, Entity)>,
+    mut query: Query<(&mut Position, &mut Velocity, &Energy, &Size, Option<&Genome>, Entity)>,
     time: Res<Time>,
     tracked: ResMut<TrackedOrganism>,
 ) {
@@ -149,7 +168,7 @@ pub fn update_movement(
     let mut rng = rand::thread_rng();
     let mut direction_changed = false;
     
-    for (mut position, mut velocity, energy, size, entity) in query.iter_mut() {
+    for (mut position, mut velocity, energy, size, genome_opt, entity) in query.iter_mut() {
         // Skip if dead or very low energy
         if energy.is_dead() || energy.ratio() < 0.1 {
             velocity.0 = Vec2::ZERO;
@@ -159,11 +178,19 @@ pub fn update_movement(
             continue;
         }
         
+        // Get max speed from genome or default based on size
+        let max_speed = if let Some(genome) = genome_opt {
+            traits::express_speed(genome)
+        } else {
+            // Fallback: larger organisms move slower
+            20.0 / size.value().max(0.5)
+        };
+        
         // Simple wandering behavior: random walk with momentum
         // Occasionally add random velocity changes
         if rng.gen_bool(0.05) { // 5% chance per frame to change direction
             let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-            let speed = rng.gen_range(5.0..15.0);
+            let speed = rng.gen_range(max_speed * 0.3..max_speed * 0.7);
             velocity.0 = Vec2::from_angle(angle) * speed;
             
             if tracked.entity == Some(entity) {
@@ -174,8 +201,7 @@ pub fn update_movement(
         // Apply velocity damping (friction)
         velocity.0 *= 0.95;
         
-        // Clamp velocity to max speed (based on size - larger organisms move slower)
-        let max_speed = 20.0 / size.value().max(0.5);
+        // Clamp velocity to max speed
         if velocity.0.length() > max_speed {
             velocity.0 = velocity.0.normalize() * max_speed;
         }
@@ -200,7 +226,7 @@ pub fn update_movement(
     // Log direction change if it happened
     if direction_changed {
         if let Some(entity) = tracked.entity {
-            if let Ok((_position, velocity, _energy, _size, _entity)) = query.get(entity) {
+            if let Ok((_position, velocity, _energy, _size, _genome, _entity)) = query.get(entity) {
                 info!("[TRACKED] Direction changed - New velocity: ({:.2}, {:.2}), Speed: {:.2}", 
                       velocity.0.x, velocity.0.y, velocity.0.length());
             }
@@ -208,12 +234,128 @@ pub fn update_movement(
     }
 }
 
-/// Update organism age
+/// Update organism age and reproduction cooldown
 pub fn update_age(
-    mut query: Query<&mut Age>,
+    mut query: Query<(&mut Age, &mut ReproductionCooldown)>,
 ) {
-    for mut age in query.iter_mut() {
+    for (mut age, mut cooldown) in query.iter_mut() {
         age.increment();
+        cooldown.decrement();
+    }
+}
+
+/// Handle reproduction - both asexual and sexual
+pub fn handle_reproduction(
+    mut commands: Commands,
+    mut query: Query<(
+        Entity,
+        &Position,
+        &mut Energy,
+        &mut ReproductionCooldown,
+        &Genome,
+        &SpeciesId,
+        &OrganismType,
+    ), With<Alive>>,
+) {
+    let mut rng = rand::thread_rng();
+    
+    // First pass: collect all organism data for mate finding
+    let all_organisms: Vec<_> = query.iter().map(|(e, p, _, _, g, s, o)| {
+        (e, *p, g.clone(), *s, *o)
+    }).collect();
+    
+    // Second pass: find candidates and their mates
+    let mut reproduction_events = Vec::new();
+    
+    for (entity, position, energy, cooldown, genome, species_id, org_type) in query.iter() {
+        if !cooldown.is_ready() {
+            continue;
+        }
+        
+        let reproduction_threshold = traits::express_reproduction_threshold(genome);
+        if energy.ratio() < reproduction_threshold {
+            continue;
+        }
+        
+        // Only attempt reproduction with a probability (not guaranteed every frame)
+        // This prevents mass reproduction when cooldown expires
+        if !rng.gen_bool(0.1) { // 10% chance per frame when conditions are met
+            continue;
+        }
+        
+        // Decide between asexual and sexual reproduction
+        let use_sexual = rng.gen_bool(0.3);
+        
+        let offspring_genome = if use_sexual {
+            // Sexual reproduction - find a mate
+            let sensory_range = traits::express_sensory_range(genome);
+            let mut mate_opt = None;
+            
+            for (other_entity, other_pos, other_genome, other_species, _) in &all_organisms {
+                if *other_entity == entity {
+                    continue; // Skip self
+                }
+                
+                if *other_species != *species_id {
+                    continue; // Only mate with same species
+                }
+                
+                let distance = (position.0 - other_pos.0).length();
+                if distance <= sensory_range {
+                    mate_opt = Some(other_genome.clone());
+                    break;
+                }
+            }
+            
+            if let Some(mate_genome) = mate_opt {
+                Genome::crossover(genome, &mate_genome, DEFAULT_MUTATION_RATE)
+            } else {
+                genome.clone_with_mutation(DEFAULT_MUTATION_RATE)
+            }
+        } else {
+            genome.clone_with_mutation(DEFAULT_MUTATION_RATE)
+        };
+        
+        reproduction_events.push((entity, *position, offspring_genome, *species_id, *org_type));
+    }
+    
+    // Third pass: actually reproduce (mutable access)
+    for (entity, position, offspring_genome, species_id, org_type) in reproduction_events {
+        if let Ok((_, _, mut energy, mut cooldown, _genome, _, _)) = query.get_mut(entity) {
+            // Express traits from offspring genome
+            let size = traits::express_size(&offspring_genome);
+            let max_energy = traits::express_max_energy(&offspring_genome);
+            let metabolism_rate = traits::express_metabolism_rate(&offspring_genome);
+            let movement_cost = traits::express_movement_cost(&offspring_genome);
+            let reproduction_cooldown = traits::express_reproduction_cooldown(&offspring_genome) as u32;
+            
+            // Spawn offset from parent (small random offset)
+            let offset_x = rng.gen_range(-5.0..5.0);
+            let offset_y = rng.gen_range(-5.0..5.0);
+            
+            // Spawn offspring
+            commands.spawn((
+                Position::new(position.0.x + offset_x, position.0.y + offset_y),
+                Velocity::new(0.0, 0.0),
+                Energy::new(max_energy * 0.5), // Start with half energy
+                Age::new(),
+                Size::new(size),
+                Metabolism::new(metabolism_rate, movement_cost),
+                ReproductionCooldown::new(reproduction_cooldown),
+                offspring_genome,
+                species_id, // Inherit species ID
+                org_type,
+                Alive,
+            ));
+            
+            // Deduct energy from parent (reproduction cost)
+            energy.current *= 0.7; // Lose 30% of energy
+            
+            // Reset cooldown
+            cooldown.reset(reproduction_cooldown);
+            
+            info!("Organism reproduced! New offspring spawned near parent");
+        }
     }
 }
 

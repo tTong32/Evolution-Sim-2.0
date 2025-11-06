@@ -156,3 +156,27 @@ pub enum OrganismType {
     Decomposer, // Fungi, bacteria - consume detritus
 }
 
+/// Reproduction cooldown (ticks remaining until organism can reproduce again)
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ReproductionCooldown(pub u32);
+
+impl ReproductionCooldown {
+    pub fn new(ticks: u32) -> Self {
+        Self(ticks)
+    }
+    
+    pub fn is_ready(&self) -> bool {
+        self.0 == 0
+    }
+    
+    pub fn decrement(&mut self) {
+        if self.0 > 0 {
+            self.0 -= 1;
+        }
+    }
+    
+    pub fn reset(&mut self, ticks: u32) {
+        self.0 = ticks;
+    }
+}
+
