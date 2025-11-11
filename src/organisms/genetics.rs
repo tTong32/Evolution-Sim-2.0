@@ -173,6 +173,15 @@ pub mod traits {
     pub const THERMAL_TOLERANCE: usize = 17;
     pub const MUTATION_CONTROL: usize = 18;
     pub const DEVELOPMENTAL_PLASTICITY: usize = 19;
+    pub const FORAGING_BIAS: usize = 20;
+    pub const RISK_TOLERANCE: usize = 21;
+    pub const EXPLORATION_DRIVE: usize = 22;
+    pub const CLUTCH_SIZE: usize = 23;
+    pub const OFFSPRING_ENERGY_SHARE: usize = 24;
+    pub const HUNGER_MEMORY: usize = 25;
+    pub const THREAT_DECAY: usize = 26;
+    pub const RESOURCE_SELECTIVITY: usize = 27;
+    pub const MIGRATION_DRIVE: usize = 28;
 
     /// Express speed trait (0.5 to 20.0 units/sec) using multiple genes.
     pub fn express_speed(genome: &Genome) -> f32 {
@@ -347,6 +356,114 @@ pub mod traits {
             -0.2,
             0.002,
             0.06,
+        )
+    }
+
+    pub fn express_foraging_drive(genome: &Genome) -> f32 {
+        express_with_weights(
+            genome,
+            &[
+                (FORAGING_BIAS, 1.1),
+                (METABOLISM_RATE, 0.4),
+                (RESOURCE_SELECTIVITY, -0.3),
+            ],
+            0.0,
+            0.0,
+            1.0,
+        )
+    }
+
+    pub fn express_risk_tolerance(genome: &Genome) -> f32 {
+        express_with_weights(
+            genome,
+            &[(RISK_TOLERANCE, 1.0), (BOLDNESS, 0.7), (AGGRESSION, 0.3)],
+            0.0,
+            0.05,
+            0.95,
+        )
+    }
+
+    pub fn express_exploration_drive(genome: &Genome) -> f32 {
+        express_with_weights(
+            genome,
+            &[
+                (EXPLORATION_DRIVE, 1.0),
+                (SENSORY_RANGE, 0.4),
+                (MIGRATION_DRIVE, 0.5),
+            ],
+            -0.2,
+            0.0,
+            1.0,
+        )
+    }
+
+    pub fn express_clutch_size(genome: &Genome) -> f32 {
+        express_with_weights(
+            genome,
+            &[
+                (CLUTCH_SIZE, 1.0),
+                (REPRODUCTIVE_INVESTMENT, -0.4),
+                (SIZE, -0.2),
+            ],
+            0.3,
+            1.0,
+            6.0,
+        )
+    }
+
+    pub fn express_offspring_energy_share(genome: &Genome) -> f32 {
+        express_with_weights(
+            genome,
+            &[
+                (OFFSPRING_ENERGY_SHARE, 1.0),
+                (REPRODUCTIVE_INVESTMENT, 0.7),
+                (METABOLISM_RATE, -0.4),
+            ],
+            0.0,
+            0.05,
+            0.45,
+        )
+    }
+
+    pub fn express_hunger_memory_rate(genome: &Genome) -> f32 {
+        express_with_weights(
+            genome,
+            &[
+                (HUNGER_MEMORY, 1.0),
+                (FORAGING_BIAS, 0.4),
+                (METABOLIC_FLEXIBILITY, 0.3),
+            ],
+            0.0,
+            0.5,
+            3.0,
+        )
+    }
+
+    pub fn express_threat_decay_rate(genome: &Genome) -> f32 {
+        express_with_weights(
+            genome,
+            &[
+                (THREAT_DECAY, 1.0),
+                (RISK_TOLERANCE, -0.6),
+                (SOCIAL_SENSITIVITY, -0.3),
+            ],
+            0.2,
+            0.2,
+            2.5,
+        )
+    }
+
+    pub fn express_resource_selectivity(genome: &Genome) -> f32 {
+        express_with_weights(
+            genome,
+            &[
+                (RESOURCE_SELECTIVITY, 1.0),
+                (FORAGING_BIAS, -0.5),
+                (SENSORY_FOCUS, 0.4),
+            ],
+            0.0,
+            0.0,
+            1.0,
         )
     }
 }

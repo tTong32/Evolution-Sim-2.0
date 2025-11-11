@@ -25,6 +25,7 @@ This document summarizes all major systems, dependencies, and development milest
   - Dynamic climate simulation (temperature gradients, rainfall, weather cycles).  
   - Events: volcanic eruptions, droughts, floods, meteor strikes.  
   - Seasonal and long-term change (ice ages, global warming).  
+  - Regional variation mapped with low-frequency climate noise and transient weather events (storms, heatwaves, droughts).  
 - **Performance:** Use sparse chunks & parallel updates (Rust multithreading).
 
 ---
@@ -34,6 +35,7 @@ This document summarizes all major systems, dependencies, and development milest
 - **Properties:**  
   - Regeneration rate, decay rate, nutrient value.  
   - Resources evolve and mutate (e.g. plants adapt leaf shape or toxin production).  
+  - Cells track local consumption pressure and adapt regeneration accordingly (resource overuse suppresses regrowth; scarcity rebounds).  
 - **Flow:**  
   - Resources flow between neighboring cells (e.g. nutrient runoff, seed dispersal).  
 
@@ -56,7 +58,7 @@ This document summarizes all major systems, dependencies, and development milest
   - Random mutations with Gaussian noise.  
   - Sexual reproduction mixes parental genes.  
 - **Expression:**  
-  - Genes map to traits via configurable trait functions (e.g. eye_sensitivity = sigmoid(gene[2])).  
+  - Traits are derived from weighted blends of multiple genes (primary loci + modifier loci controlling metabolism, risk tolerance, exploratory drive, etc.).  
   - Enables emergent traits like camouflage, speed, metabolism without hardcoding behaviors.
 
 ---
@@ -67,6 +69,7 @@ This document summarizes all major systems, dependencies, and development milest
   - Each tick, organisms use local sensory data (sight, smell, energy) to pick an action (move, eat, mate, flee).  
   - Rule-based or small state-machine approach for scalability.  
   - Behavior affected by genetic parameters (e.g. “boldness”, “curiosity”, “aggression”).  
+  - Memory-driven modifiers for hunger and threat accumulate over time, unlocking behaviors such as adaptive fleeing, sustained foraging, and long-range migration.  
 - **Actions:** Wander, chase, forage, rest, reproduce, migrate.
 
 ---
@@ -85,6 +88,7 @@ This document summarizes all major systems, dependencies, and development milest
 - **Offspring Generation:**  
   - Offspring inherits genome from parent(s).  
   - Mutation rate and genome length are evolvable.
+  - Clutch size, energy allocation per offspring, and mutation rate blending are trait-driven, enabling diverse reproduction strategies.
 
 ---
 
@@ -132,6 +136,7 @@ This document summarizes all major systems, dependencies, and development milest
 - **Hierarchical Updates:** Global climate → regional climate → chunk-level → cell-level
 - **Lazy Evaluation:** Only update cells when accessed or when climate changes significantly
 - **Event System:** Use an event queue for discrete events (volcanoes, meteors) to avoid polling
+- **Regional Noise & Events:** Blend low-frequency noise for spatial variation and spawn stochastic weather events that temporarily perturb temperature/humidity fields with smooth falloff.
 
 **Performance Optimizations:**
 - **SIMD Operations:** Use `packed_simd` or `std::arch` for vectorized temperature/humidity calculations
@@ -156,6 +161,7 @@ This document summarizes all major systems, dependencies, and development milest
 - **Plant Traits:** Store evolvable traits (toxin level, growth rate) as metadata attached to resource producers
 - **Lazy Mutation:** Only mutate plant types when reproduction occurs (not every tick)
 - **Trait Storage:** Use small hashmap or sparse array for plant trait variations per chunk
+- **Consumption Feedback:** Persist per-cell consumption pressure/adaptation factors so over-harvested resources recover slowly and climates stress-sensitive resources differently.
 
 **Performance Optimizations:**
 - **Separate Passes:** Resource regeneration → Flow → Consumption (clear separation enables parallelization)
@@ -216,6 +222,7 @@ This document summarizes all major systems, dependencies, and development milest
 - **Lazy Evaluation:** Compute traits from genome only when needed (cache traits in component)
 - **Trait Mapping Functions:** Use lookup table or match statement for gene → trait mapping
 - **Sigmoid/Activation Functions:** Apply sigmoid to genes for non-linear trait scaling: `trait = sigmoid(gene * scale + bias)`
+- **Multi-Gene Blends:** Weighted helper functions combine primary and modifier loci (e.g., fast-twitch vs. endurance, risk tolerance, migration drive) to create richer trade-offs without changing genome length.
 
 **Performance Optimizations:**
 - **SIMD for Crossover:** Use vectorized operations for bulk gene copying/merging
@@ -230,6 +237,7 @@ This document summarizes all major systems, dependencies, and development milest
 - **State Machine:** Simple enum-based state (Wandering, Chasing, Eating, Fleeing, Mating, Resting)
 - **Priority System:** Evaluate actions in priority order (survival > reproduction > exploration)
 - **Sensory Input:** Query spatial hash for nearby organisms/resources within sensory radius
+- **Behavior Memory:** Persist hunger/threat memories and migration targets to bias priorities over multiple ticks (e.g., sustained fleeing, opportunistic migration).
 
 **Rule-Based Logic:**
 - **Energy Thresholds:** `if energy < 0.3 * max_energy { prioritize_food() }`
@@ -296,6 +304,7 @@ This document summarizes all major systems, dependencies, and development milest
 - **Energy Split:** Parent(s) lose energy (e.g., `parent_energy *= 0.7`)
 - **Spawn Position:** Place near parent with small random offset (avoid overlap)
 - **Initial Energy:** Set offspring energy to fraction of parent's energy
+- **Clutch Planning:** Use trait-driven clutch size, per-offspring energy shares, and averaged parental mutation rates to shape reproductive strategy.
 
 **Mutation Rate Evolution:**
 - **Self-Modifying:** Store mutation rate as gene in genome (mutates itself)

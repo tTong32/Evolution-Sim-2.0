@@ -1,5 +1,6 @@
 use crate::world::cell::{Cell, TerrainType};
 use bevy::prelude::*;
+use glam::Vec2;
 
 /// Global climate state
 #[derive(Resource, Clone, Debug)]
@@ -12,6 +13,14 @@ pub struct ClimateState {
     pub season: f32,
     /// Time in simulation ticks
     pub time: u64,
+    /// Phase offset for spatial variation
+    pub noise_phase: f32,
+    /// Cooldown before spawning next stochastic event
+    pub event_cooldown: f32,
+    /// Active transient climate events
+    pub events: Vec<ClimateEvent>,
+    /// Seed driving deterministic regional offsets
+    pub regional_seed: u64,
 }
 
 impl Default for ClimateState {
@@ -21,6 +30,10 @@ impl Default for ClimateState {
             base_humidity: 0.5,
             season: 0.0,
             time: 0,
+            noise_phase: 0.0,
+            event_cooldown: 120.0,
+            events: Vec::new(),
+            regional_seed: fastrand::u64(..),
         }
     }
 }
@@ -44,12 +57,28 @@ impl ClimateState {
             ((self.season * 2.0 * std::f32::consts::PI) + std::f32::consts::PI).sin() * 0.15;
         self.base_humidity = 0.5 + seasonal_humidity;
 
-        // Long-term climate drift (slow random walk for ice ages/global warming)
-        // This is a simplified version - can be enhanced later
-        // OPTIMIZED: Use fastrand instead of thread_rng() for better performance
+        // Long-term climate drift
         let drift_rate = 0.0001;
         self.base_temperature += (fastrand::f32() - 0.5) * drift_rate;
         self.base_temperature = self.base_temperature.clamp(0.2, 0.8);
+
+        let dt = 1.0f32;
+        self.noise_phase += 0.015 * dt;
+
+        // Decay stochastic events
+        for event in &mut self.events {
+            event.time_remaining -= dt;
+        }
+        self.events.retain(|event| event.time_remaining > 0.0);
+
+        // Randomly spawn new event
+        self.event_cooldown -= dt;
+        if self.event_cooldown <= 0.0 {
+            if fastrand::f32() < 0.02 {
+                self.spawn_event();
+            }
+            self.event_cooldown = fastrand::f32() * 300.0 + 120.0;
+        }
     }
 
     /// Get temperature for a cell based on elevation and terrain
@@ -57,19 +86,19 @@ impl ClimateState {
         let base = self.base_temperature;
 
         // Elevation effect (higher = colder)
-        let elevation_factor = (elevation as f32 / 65535.0) * 0.3; // Max 0.3 colder at max elevation
+        let elevation_factor = (elevation as f32 / 65535.0) * 0.3;
         let elevation_effect = -elevation_factor;
 
         // Terrain modifiers
         let terrain_modifier = match terrain {
-            TerrainType::Ocean => 0.0,      // Ocean moderates temperature
-            TerrainType::Plains => 0.0,     // Neutral
-            TerrainType::Forest => -0.05,   // Slightly cooler
-            TerrainType::Desert => 0.15,    // Hotter
-            TerrainType::Tundra => -0.2,    // Much colder
-            TerrainType::Mountain => -0.25, // Very cold
-            TerrainType::Swamp => 0.05,     // Slightly warmer
-            TerrainType::Volcanic => 0.3,   // Very hot
+            TerrainType::Ocean => 0.0,
+            TerrainType::Plains => 0.0,
+            TerrainType::Forest => -0.05,
+            TerrainType::Desert => 0.15,
+            TerrainType::Tundra => -0.2,
+            TerrainType::Mountain => -0.25,
+            TerrainType::Swamp => 0.05,
+            TerrainType::Volcanic => 0.3,
         };
 
         (base + elevation_effect + terrain_modifier).clamp(0.0, 1.0)
@@ -79,27 +108,88 @@ impl ClimateState {
     pub fn get_cell_humidity(&self, terrain: TerrainType, temperature: f32) -> f32 {
         let base = self.base_humidity;
 
-        // Terrain modifiers
         let terrain_modifier = match terrain {
-            TerrainType::Ocean => 0.3,     // Very humid
-            TerrainType::Plains => 0.0,    // Neutral
-            TerrainType::Forest => 0.2,    // Humid
-            TerrainType::Desert => -0.3,   // Very dry
-            TerrainType::Tundra => 0.1,    // Slightly humid
-            TerrainType::Mountain => -0.1, // Dry (high altitude)
-            TerrainType::Swamp => 0.4,     // Very humid
-            TerrainType::Volcanic => -0.2, // Dry
+            TerrainType::Ocean => 0.3,
+            TerrainType::Plains => 0.0,
+            TerrainType::Forest => 0.2,
+            TerrainType::Desert => -0.3,
+            TerrainType::Tundra => 0.1,
+            TerrainType::Mountain => -0.1,
+            TerrainType::Swamp => 0.4,
+            TerrainType::Volcanic => -0.2,
         };
 
-        // Temperature effect (hotter = can hold more water, but evaporation increases)
         let temp_effect = (temperature - 0.5) * 0.2;
 
         (base + terrain_modifier + temp_effect).clamp(0.0, 1.0)
     }
+
+    fn regional_offsets(&self, world_pos: Vec2) -> (f32, f32) {
+        let scale = 0.005;
+        let angle_x = world_pos.x * scale + self.noise_phase;
+        let angle_y = world_pos.y * scale * 1.3 - self.noise_phase * 0.6;
+        let temp = (angle_x.sin() * angle_y.cos()) * 0.08;
+        let humidity = (angle_x.cos() * 0.06) + (angle_y.sin() * 0.05);
+        (temp, humidity)
+    }
+
+    fn event_offsets(&self, world_pos: Vec2) -> (f32, f32) {
+        let mut temp = 0.0;
+        let mut humidity = 0.0;
+        for event in &self.events {
+            let distance = world_pos.distance(event.center);
+            if distance <= event.radius {
+                let influence = 1.0 - (distance / event.radius).powf(1.5);
+                temp += event.temperature_delta * influence;
+                humidity += event.humidity_delta * influence;
+            }
+        }
+        (temp, humidity)
+    }
+
+    fn spawn_event(&mut self) {
+        let mut rng = fastrand::Rng::with_seed(self.regional_seed ^ self.time);
+        let center = Vec2::new(rng.f32() * 400.0 - 200.0, rng.f32() * 400.0 - 200.0);
+        let radius = rng.f32() * 120.0 + 60.0;
+        let (temperature_delta, humidity_delta, duration) = match rng.u8(..4) {
+            0 => (0.08, -0.12, 180.0), // heatwave
+            1 => (-0.1, 0.15, 200.0),  // cold rainstorm
+            2 => (0.0, -0.2, 220.0),   // drought
+            _ => (0.05, 0.18, 160.0),  // tropical storm
+        };
+
+        self.events.push(ClimateEvent {
+            center,
+            radius,
+            temperature_delta,
+            humidity_delta,
+            time_remaining: duration,
+        });
+    }
 }
 
 /// Update climate for a single cell
-pub fn update_cell_climate(cell: &mut Cell, climate: &ClimateState) {
-    cell.temperature = climate.get_cell_temperature(cell.elevation, cell.terrain);
-    cell.humidity = climate.get_cell_humidity(cell.terrain, cell.temperature);
+pub fn update_cell_climate(cell: &mut Cell, climate: &ClimateState, world_pos: Vec2) {
+    let mut temperature = climate.get_cell_temperature(cell.elevation, cell.terrain);
+    let mut humidity = climate.get_cell_humidity(cell.terrain, temperature);
+
+    let (regional_temp, regional_humidity) = climate.regional_offsets(world_pos);
+    temperature += regional_temp;
+    humidity += regional_humidity;
+
+    let (event_temp, event_humidity) = climate.event_offsets(world_pos);
+    temperature += event_temp;
+    humidity += event_humidity;
+
+    cell.temperature = temperature.clamp(0.0, 1.0);
+    cell.humidity = humidity.clamp(0.0, 1.0);
+}
+
+#[derive(Clone, Debug)]
+pub struct ClimateEvent {
+    pub center: Vec2,
+    pub radius: f32,
+    pub temperature_delta: f32,
+    pub humidity_delta: f32,
+    pub time_remaining: f32,
 }

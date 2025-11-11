@@ -7,6 +7,7 @@ mod terrain;
 
 use bevy::prelude::*;
 use bevy::time::Time;
+use glam::Vec2;
 
 pub use cell::Cell;
 pub use cell::{ResourceType, TerrainType};
@@ -70,7 +71,11 @@ fn update_chunks(mut world_grid: ResMut<WorldGrid>, climate: Res<ClimateState>) 
             for y in 0..crate::world::chunk::CHUNK_SIZE {
                 for x in 0..crate::world::chunk::CHUNK_SIZE {
                     if let Some(cell) = chunk.get_cell_mut(x, y) {
-                        climate::update_cell_climate(cell, climate.as_ref());
+                        let world_pos = Vec2::new(
+                            chunk_x as f32 * crate::world::chunk::CHUNK_SIZE as f32 + x as f32,
+                            chunk_y as f32 * crate::world::chunk::CHUNK_SIZE as f32 + y as f32,
+                        );
+                        climate::update_cell_climate(cell, climate.as_ref(), world_pos);
                     }
                 }
             }

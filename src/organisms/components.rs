@@ -172,6 +172,14 @@ pub struct CachedTraits {
     pub aggression: f32,
     pub boldness: f32,
     pub mutation_rate: f32,
+    pub foraging_drive: f32,
+    pub risk_tolerance: f32,
+    pub exploration_drive: f32,
+    pub clutch_size: f32,
+    pub offspring_energy_share: f32,
+    pub hunger_memory_rate: f32,
+    pub threat_decay_rate: f32,
+    pub resource_selectivity: f32,
 }
 
 impl CachedTraits {
@@ -189,6 +197,14 @@ impl CachedTraits {
             aggression: traits::express_aggression(genome),
             boldness: traits::express_boldness(genome),
             mutation_rate: traits::express_mutation_rate(genome),
+            foraging_drive: traits::express_foraging_drive(genome),
+            risk_tolerance: traits::express_risk_tolerance(genome),
+            exploration_drive: traits::express_exploration_drive(genome),
+            clutch_size: traits::express_clutch_size(genome),
+            offspring_energy_share: traits::express_offspring_energy_share(genome),
+            hunger_memory_rate: traits::express_hunger_memory_rate(genome),
+            threat_decay_rate: traits::express_threat_decay_rate(genome),
+            resource_selectivity: traits::express_resource_selectivity(genome),
         }
     }
 }

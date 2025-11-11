@@ -71,12 +71,22 @@ pub fn regenerate_resources(cell: &mut Cell, dt: f32) {
         };
 
         let humidity_mult = humidity_regeneration_multiplier(cell.humidity, resource_type);
-        let effective_rate = regeneration_rate * temp_mult * humidity_mult;
+        let adaptation = 1.0 + cell.resource_adaptation[resource_idx].clamp(-0.5, 1.5);
+        let effective_rate = regeneration_rate * temp_mult * humidity_mult * adaptation;
 
         let current = cell.resource_density[resource_idx];
         let new_value = (current + effective_rate * dt).min(MAX_RESOURCE_DENSITY);
         cell.resource_density[resource_idx] = new_value;
+
+        // Gradually relax pressure memory
+        let pressure = cell.resource_pressure[resource_idx];
+        if pressure > 0.0 {
+            cell.resource_pressure[resource_idx] =
+                (pressure - dt * 0.1 * (1.0 + pressure * 0.2)).max(0.0);
+        }
     }
+
+    update_resource_adaptation(cell, dt);
 }
 
 /// Apply decay to resources in a cell
@@ -95,5 +105,25 @@ pub fn quantize_resources(cell: &mut Cell, threshold: f32) {
         if *resource < threshold {
             *resource = 0.0;
         }
+    }
+}
+
+/// Adjust resource adaptation based on sustained pressure and climate
+fn update_resource_adaptation(cell: &mut Cell, dt: f32) {
+    for idx in 0..RESOURCE_TYPE_COUNT {
+        let pressure = cell.resource_pressure[idx];
+        let target = (pressure * 0.08) - 0.05; // mild boost under pressure
+        let current = cell.resource_adaptation[idx];
+
+        // Climate stress pushes adaptation negative for plants & water
+        let climate_stress = match idx {
+            x if x == ResourceType::Plant as usize || x == ResourceType::Water as usize => {
+                ((0.5 - cell.humidity).abs() + (0.5 - cell.temperature).abs()) * 0.15
+            }
+            _ => 0.0,
+        };
+
+        let delta = (target - current) * dt * 0.5 - climate_stress * dt;
+        cell.resource_adaptation[idx] = (current + delta).clamp(-0.5, 1.5);
     }
 }

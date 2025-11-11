@@ -13,6 +13,10 @@ pub struct Cell {
     /// Resource densities for each resource type
     /// [Plant, Mineral, Sunlight, Water, Detritus, Prey]
     pub resource_density: [f32; 6],
+    /// Rolling measure of recent consumption pressure per resource type
+    pub resource_pressure: [f32; 6],
+    /// Adaptive modifier per resource type (responds to pressure & climate)
+    pub resource_adaptation: [f32; 6],
 }
 
 impl Default for Cell {
@@ -23,6 +27,8 @@ impl Default for Cell {
             elevation: 0,
             terrain: TerrainType::Plains,
             resource_density: [0.0; 6],
+            resource_pressure: [0.0; 6],
+            resource_adaptation: [0.0; 6],
         }
     }
 }
@@ -55,6 +61,12 @@ impl Cell {
     pub fn add_resource(&mut self, resource_type: ResourceType, amount: f32) {
         let idx = resource_type as usize;
         self.resource_density[idx] = (self.resource_density[idx] + amount).max(0.0);
+    }
+
+    /// Increase recent consumption pressure for a resource type
+    pub fn add_pressure(&mut self, resource_type: ResourceType, amount: f32) {
+        let idx = resource_type as usize;
+        self.resource_pressure[idx] = (self.resource_pressure[idx] + amount).min(10.0);
     }
 }
 

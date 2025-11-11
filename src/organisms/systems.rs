@@ -4,12 +4,13 @@ use crate::organisms::genetics::{traits, Genome};
 use crate::utils::SpatialHashGrid;
 use crate::world::{ResourceType, WorldGrid};
 use bevy::prelude::*;
+use glam::Vec2;
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
-const ALL_ORGANISMS_HEADER: &str = "tick,entity,position_x,position_y,velocity_x,velocity_y,speed,energy_current,energy_max,energy_ratio,age,size,organism_type,behavior_state,state_time,target_x,target_y,target_entity,sensory_range,aggression,boldness,mutation_rate,reproduction_threshold,reproduction_cooldown";
+const ALL_ORGANISMS_HEADER: &str = "tick,entity,position_x,position_y,velocity_x,velocity_y,speed,energy_current,energy_max,energy_ratio,age,size,organism_type,behavior_state,state_time,target_x,target_y,target_entity,sensory_range,aggression,boldness,mutation_rate,reproduction_threshold,reproduction_cooldown,foraging_drive,risk_tolerance,exploration_drive,clutch_size,offspring_energy_share,hunger_memory,threat_timer,resource_selectivity,migration_target_x,migration_target_y,migration_active";
 
 fn ensure_logs_directory() -> PathBuf {
     let logs_dir = PathBuf::from("data/logs");
@@ -277,6 +278,20 @@ pub fn update_behavior(
         // Update state time
         behavior.state_time += dt;
 
+        // Settle migration target if already reached
+        if let Some(target) = behavior.migration_target {
+            if (position.0 - target).length() < 4.0 {
+                behavior.migration_target = None;
+            }
+        }
+
+        // Update hunger & threat memories
+        let hunger_input = (1.0 - energy.ratio()).max(0.0);
+        behavior.hunger_memory = (behavior.hunger_memory
+            + hunger_input * cached_traits.hunger_memory_rate * dt)
+            .min(2.0);
+        behavior.hunger_memory *= (1.0 - dt * 0.25).max(0.65);
+
         // Get sensory range from cached traits
         let sensory_range = cached_traits.sensory_range;
 
@@ -293,20 +308,46 @@ pub fn update_behavior(
             &organism_query,
         );
 
+        if let Some((_, threat_pos, _)) = sensory.nearest_predator {
+            behavior.threat_timer =
+                (behavior.threat_timer + cached_traits.threat_decay_rate).min(10.0);
+            behavior.recent_threat = Some(threat_pos);
+        } else {
+            behavior.threat_timer =
+                (behavior.threat_timer - dt * cached_traits.threat_decay_rate).max(0.0);
+            if behavior.threat_timer <= 0.0 {
+                behavior.recent_threat = None;
+            }
+        }
+
         // Make behavior decision using cached traits
-        let (new_state, target_entity, target_position) = decide_behavior(
+        let decision = decide_behavior_with_memory(
             energy,
             cached_traits,
             *organism_type,
             &sensory,
             behavior.state,
             behavior.state_time,
+            behavior.hunger_memory,
+            behavior.threat_timer,
+            behavior.recent_threat,
+            behavior.migration_target.is_some(),
         );
 
-        // Update behavior state
-        behavior.set_state(new_state);
-        behavior.target_entity = target_entity;
-        behavior.target_position = target_position;
+        // Update behavior state and targets
+        behavior.set_state(decision.state);
+        behavior.target_entity = decision.target_entity;
+        behavior.target_position = decision.target_position;
+
+        if matches!(behavior.state, BehaviorState::Migrating) {
+            if let Some(target) = decision
+                .migration_target
+                .or(behavior.migration_target)
+                .or_else(|| sensory.richest_resource.map(|(pos, _, _, _)| pos))
+            {
+                behavior.migration_target = Some(target);
+            }
+        }
     }
 }
 
@@ -432,6 +473,9 @@ pub fn handle_eating(
                         ResourceType::Mineral,
                         cell.get_resource(ResourceType::Mineral) - mineral,
                     );
+                    cell.add_pressure(ResourceType::Sunlight, sunlight);
+                    cell.add_pressure(ResourceType::Water, water);
+                    cell.add_pressure(ResourceType::Mineral, mineral);
 
                     (sunlight + water + mineral) * energy_conversion_efficiency
                 }
@@ -452,6 +496,8 @@ pub fn handle_eating(
                         ResourceType::Prey,
                         cell.get_resource(ResourceType::Prey) - prey_resource,
                     );
+                    cell.add_pressure(ResourceType::Plant, plant);
+                    cell.add_pressure(ResourceType::Prey, prey_resource);
 
                     (plant + prey_resource * 2.0) * energy_conversion_efficiency
                     // Prey is more nutritious
@@ -466,6 +512,7 @@ pub fn handle_eating(
                         ResourceType::Detritus,
                         cell.get_resource(ResourceType::Detritus) - detritus,
                     );
+                    cell.add_pressure(ResourceType::Detritus, detritus);
 
                     detritus * energy_conversion_efficiency * 0.5 // Less efficient
                 }
@@ -504,8 +551,17 @@ pub fn handle_reproduction(
     spatial_hash: Res<SpatialHashGrid>,
     organism_query: Query<(Entity, &Position, &Genome, &SpeciesId, &CachedTraits), With<Alive>>,
 ) {
+    struct PendingSpawn {
+        parent: Entity,
+        position: Vec2,
+        genomes: Vec<Genome>,
+        species_id: SpeciesId,
+        organism_type: OrganismType,
+        energy_share: f32,
+    }
+
     let mut rng = fastrand::Rng::new();
-    let mut reproduction_events = Vec::new();
+    let mut reproduction_events: Vec<PendingSpawn> = Vec::new();
 
     for (entity, position, energy, cooldown, genome, cached_traits, species_id, org_type) in
         query.iter()
@@ -514,48 +570,45 @@ pub fn handle_reproduction(
             continue;
         }
 
-        // Use cached reproduction threshold
         if energy.ratio() < cached_traits.reproduction_threshold {
             continue;
         }
 
-        // Only attempt reproduction with a probability (not guaranteed every frame)
-        // This prevents mass reproduction when cooldown expires
         if rng.f32() >= 0.1 {
-            // 10% chance per frame when conditions are met
+            continue; // 10% chance per frame when conditions are met
+        }
+
+        let clutch_size = cached_traits.clutch_size.max(1.0).round().clamp(1.0, 6.0) as usize;
+        if clutch_size == 0 {
             continue;
         }
 
-        // Decide between asexual and sexual reproduction
-        let use_sexual = rng.f32() < 0.3;
-
         let parent_mutation_rate = cached_traits.mutation_rate.clamp(0.001, 0.08);
+        let use_sexual = rng.f32() < 0.35;
 
-        let offspring_genome = if use_sexual {
-            // Sexual reproduction - find a mate using spatial hash
+        let mut mate_data: Option<(Genome, f32)> = None;
+
+        if use_sexual {
             let sensory_range = cached_traits.sensory_range;
-            let mut mate_opt: Option<(Genome, f32)> = None;
-
-            // Use spatial hash to only check nearby organisms
             let nearby_entities = spatial_hash
                 .organisms
                 .query_radius(position.0, sensory_range);
 
             for other_entity in nearby_entities {
                 if other_entity == entity {
-                    continue; // Skip self
+                    continue;
                 }
 
                 if let Ok((_, other_pos, other_genome, other_species, other_traits)) =
                     organism_query.get(other_entity)
                 {
                     if *other_species != *species_id {
-                        continue; // Only mate with same species
+                        continue;
                     }
 
                     let distance = (position.0 - other_pos.0).length();
                     if distance <= sensory_range {
-                        mate_opt = Some((
+                        mate_data = Some((
                             other_genome.clone(),
                             other_traits.mutation_rate.clamp(0.001, 0.08),
                         ));
@@ -563,62 +616,81 @@ pub fn handle_reproduction(
                     }
                 }
             }
+        }
 
-            if let Some((mate_genome, mate_mutation_rate)) = mate_opt {
-                let crossover_rate =
-                    ((parent_mutation_rate + mate_mutation_rate) * 0.5).clamp(0.001, 0.08);
-                Genome::crossover(genome, &mate_genome, crossover_rate)
-            } else {
-                genome.clone_with_mutation(parent_mutation_rate)
+        let mut offspring_genomes = Vec::with_capacity(clutch_size);
+        if let Some((mate_genome, mate_mut_rate)) = mate_data.as_ref() {
+            let crossover_rate = ((parent_mutation_rate + mate_mut_rate) * 0.5).clamp(0.001, 0.08);
+            for _ in 0..clutch_size {
+                offspring_genomes.push(Genome::crossover(genome, mate_genome, crossover_rate));
             }
         } else {
-            genome.clone_with_mutation(parent_mutation_rate)
-        };
+            for _ in 0..clutch_size {
+                offspring_genomes.push(genome.clone_with_mutation(parent_mutation_rate));
+            }
+        }
 
-        reproduction_events.push((entity, position.0, offspring_genome, *species_id, *org_type));
+        reproduction_events.push(PendingSpawn {
+            parent: entity,
+            position: position.0,
+            genomes: offspring_genomes,
+            species_id: *species_id,
+            organism_type: *org_type,
+            energy_share: cached_traits.offspring_energy_share,
+        });
     }
 
-    // Third pass: actually reproduce (mutable access)
-    for (entity, _position, offspring_genome, species_id, org_type) in reproduction_events {
-        if let Ok((_, _, mut energy, mut cooldown, _, _, _, _)) = query.get_mut(entity) {
-            // Express traits from offspring genome (for Size component)
-            let size = traits::express_size(&offspring_genome);
-            let max_energy = traits::express_max_energy(&offspring_genome);
-            let metabolism_rate = traits::express_metabolism_rate(&offspring_genome);
-            let movement_cost = traits::express_movement_cost(&offspring_genome);
-            let reproduction_cooldown =
-                traits::express_reproduction_cooldown(&offspring_genome) as u32;
+    for event in reproduction_events {
+        if let Ok((_, _, mut parent_energy, mut parent_cooldown, _, parent_traits, _, _)) =
+            query.get_mut(event.parent)
+        {
+            let count = event.genomes.len() as f32;
+            if count == 0.0 {
+                continue;
+            }
 
-            // Spawn offset from parent (small random offset)
-            let offset_x = rng.f32() * 10.0 - 5.0;
-            let offset_y = rng.f32() * 10.0 - 5.0;
+            let available_energy = parent_energy.current.max(0.0);
+            let per_child_energy = (available_energy * event.energy_share)
+                .min(available_energy / count)
+                .max(0.0);
+            let total_energy_cost = per_child_energy * count;
+            parent_energy.current = (available_energy - total_energy_cost).max(0.0);
 
-            // Spawn offspring with cached traits
-            let cached_traits = CachedTraits::from_genome(&offspring_genome);
+            for offspring_genome in event.genomes {
+                let cached = CachedTraits::from_genome(&offspring_genome);
+                let size = cached.size;
+                let max_energy = cached.max_energy;
+                let metabolism_rate = cached.metabolism_rate;
+                let movement_cost = cached.movement_cost;
+                let reproduction_cooldown = cached.reproduction_cooldown.max(1.0) as u32;
 
-            commands.spawn((
-                Position::new(_position.x + offset_x, _position.y + offset_y),
-                Velocity::new(0.0, 0.0),
-                Energy::new(max_energy * 0.5), // Start with half energy
-                Age::new(),
-                Size::new(size),
-                Metabolism::new(metabolism_rate, movement_cost),
-                ReproductionCooldown::new(reproduction_cooldown),
-                offspring_genome,
-                cached_traits,
-                species_id, // Inherit species ID
-                org_type,
-                Behavior::new(),
-                Alive,
-            ));
+                let offset = Vec2::new(rng.f32() * 10.0 - 5.0, rng.f32() * 10.0 - 5.0);
+                let initial_energy = (per_child_energy * 0.9)
+                    .min(max_energy)
+                    .max(max_energy * 0.15);
 
-            // Deduct energy from parent (reproduction cost)
-            energy.current *= 0.7; // Lose 30% of energy
+                commands.spawn((
+                    Position::new(event.position.x + offset.x, event.position.y + offset.y),
+                    Velocity::new(0.0, 0.0),
+                    Energy::with_energy(max_energy, initial_energy),
+                    Age::new(),
+                    Size::new(size),
+                    Metabolism::new(metabolism_rate, movement_cost),
+                    ReproductionCooldown::new(reproduction_cooldown),
+                    offspring_genome,
+                    cached,
+                    event.species_id,
+                    event.organism_type,
+                    Behavior::new(),
+                    Alive,
+                ));
+            }
 
-            // Reset cooldown
-            cooldown.reset(reproduction_cooldown);
-
-            info!("Organism reproduced! New offspring spawned near parent");
+            parent_cooldown.reset(parent_traits.reproduction_cooldown.max(1.0) as u32);
+            info!(
+                "Organism reproduced! Spawned {} offspring near parent",
+                count as u32
+            );
         }
     }
 }
@@ -701,10 +773,21 @@ pub fn log_all_organisms(
                 .target_entity
                 .map(|entity| entity.index().to_string())
                 .unwrap_or_else(|| "None".to_string());
+            let migration = behavior.migration_target.or(behavior.target_position);
+            let (migration_x, migration_y) = migration
+                .map(|pos| (pos.x, pos.y))
+                .unwrap_or((f32::NAN, f32::NAN));
+            let migration_active = if behavior.state == BehaviorState::Migrating
+                || behavior.migration_target.is_some()
+            {
+                1u8
+            } else {
+                0u8
+            };
 
             writeln!(
                 writer,
-                "{tick},{entity},{pos_x:.6},{pos_y:.6},{vel_x:.6},{vel_y:.6},{speed:.6},{energy_current:.6},{energy_max:.6},{energy_ratio:.6},{age},{size:.6},{organism_type},{behavior_state},{state_time:.6},{target_x:.6},{target_y:.6},{target_entity},{sensory_range:.6},{aggression:.6},{boldness:.6},{mutation_rate:.6},{reproduction_threshold:.6},{reproduction_cooldown:.6}",
+                "{tick},{entity},{pos_x:.6},{pos_y:.6},{vel_x:.6},{vel_y:.6},{speed:.6},{energy_current:.6},{energy_max:.6},{energy_ratio:.6},{age},{size:.6},{organism_type},{behavior_state},{state_time:.6},{target_x:.6},{target_y:.6},{target_entity},{sensory_range:.6},{aggression:.6},{boldness:.6},{mutation_rate:.6},{reproduction_threshold:.6},{reproduction_cooldown:.6},{foraging_drive:.6},{risk_tolerance:.6},{exploration_drive:.6},{clutch_size:.6},{offspring_share:.6},{hunger_memory:.6},{threat_timer:.6},{resource_selectivity:.6},{migration_x:.6},{migration_y:.6},{migration_active}",
                 tick = tick,
                 entity = entity.index(),
                 pos_x = position.0.x,
@@ -729,6 +812,17 @@ pub fn log_all_organisms(
                 mutation_rate = cached_traits.mutation_rate,
                 reproduction_threshold = cached_traits.reproduction_threshold,
                 reproduction_cooldown = cached_traits.reproduction_cooldown,
+                foraging_drive = cached_traits.foraging_drive,
+                risk_tolerance = cached_traits.risk_tolerance,
+                exploration_drive = cached_traits.exploration_drive,
+                clutch_size = cached_traits.clutch_size,
+                offspring_share = cached_traits.offspring_energy_share,
+                hunger_memory = behavior.hunger_memory,
+                threat_timer = behavior.threat_timer,
+                resource_selectivity = cached_traits.resource_selectivity,
+                migration_x = migration_x,
+                migration_y = migration_y,
+                migration_active = migration_active
             )
             .expect("Failed to write all-organism CSV row");
         }
@@ -827,7 +921,7 @@ pub fn log_tracked_organism(
                 if needs_header {
                     writeln!(
                         writer,
-                        "tick,position_x,position_y,velocity_x,velocity_y,speed,energy_current,energy_max,energy_ratio,age,size,organism_type,behavior_state,state_time,target_x,target_y,target_entity,sensory_range,aggression,boldness,mutation_rate"
+                        "tick,position_x,position_y,velocity_x,velocity_y,speed,energy_current,energy_max,energy_ratio,age,size,organism_type,behavior_state,state_time,target_x,target_y,target_entity,sensory_range,aggression,boldness,mutation_rate,foraging_drive,risk_tolerance,exploration_drive,clutch_size,offspring_energy_share,hunger_memory,threat_timer,resource_selectivity,migration_target_x,migration_target_y,migration_active"
                     )
                     .expect("Failed to write CSV header");
                 }
@@ -837,31 +931,58 @@ pub fn log_tracked_organism(
                 } else {
                     (f32::NAN, f32::NAN)
                 };
+                let target_entity = behavior
+                    .target_entity
+                    .map(|entity| entity.index().to_string())
+                    .unwrap_or_else(|| "None".to_string());
+                let (migration_x, migration_y) = behavior
+                    .migration_target
+                    .or(behavior.target_position)
+                    .map(|pos| (pos.x, pos.y))
+                    .unwrap_or((f32::NAN, f32::NAN));
+                let migration_active = if behavior.state == BehaviorState::Migrating
+                    || behavior.migration_target.is_some()
+                {
+                    1u8
+                } else {
+                    0u8
+                };
 
                 writeln!(
                     writer,
-                    "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:?},{},{:.6},{:.6},{:.6},{:?},{:.6},{:.6},{:.6},{:.6}",
-                    tick,
-                    position.0.x,
-                    position.0.y,
-                    velocity.0.x,
-                    velocity.0.y,
-                    speed,
-                    energy.current,
-                    energy.max,
-                    energy.ratio(),
-                    age.0,
-                    size.value(),
-                    org_type,
-                    behavior_state,
-                    behavior.state_time,
-                    target_x,
-                    target_y,
-                    behavior.target_entity,
-                    sensory_range,
-                    aggression,
-                    boldness,
-                    mutation_rate
+                    "{tick},{pos_x:.6},{pos_y:.6},{vel_x:.6},{vel_y:.6},{speed:.6},{energy_current:.6},{energy_max:.6},{energy_ratio:.6},{age},{size:.6},{organism_type:?},{behavior_state},{state_time:.6},{target_x:.6},{target_y:.6},{target_entity},{sensory_range:.6},{aggression:.6},{boldness:.6},{mutation_rate:.6},{foraging_drive:.6},{risk_tolerance:.6},{exploration_drive:.6},{clutch_size:.6},{offspring_share:.6},{hunger_memory:.6},{threat_timer:.6},{resource_selectivity:.6},{migration_x:.6},{migration_y:.6},{migration_active}",
+                    tick = tick,
+                    pos_x = position.0.x,
+                    pos_y = position.0.y,
+                    vel_x = velocity.0.x,
+                    vel_y = velocity.0.y,
+                    speed = speed,
+                    energy_current = energy.current,
+                    energy_max = energy.max,
+                    energy_ratio = energy.ratio(),
+                    age = age.0,
+                    size = size.value(),
+                    organism_type = org_type,
+                    behavior_state = behavior_state,
+                    state_time = behavior.state_time,
+                    target_x = target_x,
+                    target_y = target_y,
+                    target_entity = target_entity,
+                    sensory_range = sensory_range,
+                    aggression = aggression,
+                    boldness = boldness,
+                    mutation_rate = mutation_rate,
+                    foraging_drive = cached_traits.foraging_drive,
+                    risk_tolerance = cached_traits.risk_tolerance,
+                    exploration_drive = cached_traits.exploration_drive,
+                    clutch_size = cached_traits.clutch_size,
+                    offspring_share = cached_traits.offspring_energy_share,
+                    hunger_memory = behavior.hunger_memory,
+                    threat_timer = behavior.threat_timer,
+                    resource_selectivity = cached_traits.resource_selectivity,
+                    migration_x = migration_x,
+                    migration_y = migration_y,
+                    migration_active = migration_active
                 )
                 .expect("Failed to write CSV row");
 

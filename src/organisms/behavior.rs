@@ -18,6 +18,8 @@ pub enum BehaviorState {
     Mating,
     /// Resting (low energy, not moving much)
     Resting,
+    /// Long-range movement toward richer territory
+    Migrating,
 }
 
 /// Component tracking organism's current behavior state
@@ -30,6 +32,14 @@ pub struct Behavior {
     pub target_position: Option<Vec2>,
     /// Time in current state (for state transitions)
     pub state_time: f32,
+    /// Rolling memory of hunger pressure (0-1)
+    pub hunger_memory: f32,
+    /// Timer tracking recent threats (seconds remaining)
+    pub threat_timer: f32,
+    /// Location of the last perceived threat
+    pub recent_threat: Option<Vec2>,
+    /// Long-range migration target (if any)
+    pub migration_target: Option<Vec2>,
 }
 
 impl Default for Behavior {
@@ -39,6 +49,10 @@ impl Default for Behavior {
             target_entity: None,
             target_position: None,
             state_time: 0.0,
+            hunger_memory: 0.0,
+            threat_timer: 0.0,
+            recent_threat: None,
+            migration_target: None,
         }
     }
 }
@@ -55,6 +69,9 @@ impl Behavior {
             // Clear targets when changing states
             self.target_entity = None;
             self.target_position = None;
+            if !matches!(self.state, BehaviorState::Migrating) {
+                self.migration_target = None;
+            }
         }
     }
 }
@@ -68,6 +85,10 @@ pub struct SensoryData {
     pub nearby_resources: Vec<(Vec2, ResourceType, f32, f32)>,
     /// Current cell resource values
     pub current_cell_resources: [f32; 6],
+    /// Closest predator information
+    pub nearest_predator: Option<(Entity, Vec2, f32)>,
+    /// Highest value resource in range
+    pub richest_resource: Option<(Vec2, ResourceType, f32, f32)>,
 }
 
 impl SensoryData {
@@ -76,6 +97,8 @@ impl SensoryData {
             nearby_organisms: Vec::new(),
             nearby_resources: Vec::new(),
             current_cell_resources: [0.0; 6],
+            nearest_predator: None,
+            richest_resource: None,
         }
     }
 }
@@ -123,6 +146,13 @@ pub fn collect_sensory_data(
                     && !other_energy.is_dead()
                     && distance <= sensory_range * 0.5; // Mates need to be closer
 
+                if is_predator {
+                    match &mut sensory.nearest_predator {
+                        Some((_, _, current_distance)) if *current_distance <= distance => {}
+                        _ => sensory.nearest_predator = Some((other_entity, other_pos.0, distance)),
+                    }
+                }
+
                 sensory.nearby_organisms.push((
                     other_entity,
                     other_pos.0,
@@ -160,12 +190,18 @@ pub fn collect_sensory_data(
                         let value = cell.get_resource(*resource_type);
                         if value > 0.1 {
                             // Only consider cells with meaningful resources
-                            sensory.nearby_resources.push((
-                                Vec2::new(check_x, check_y),
-                                *resource_type,
-                                distance,
-                                value,
-                            ));
+                            let entry =
+                                (Vec2::new(check_x, check_y), *resource_type, distance, value);
+
+                            if let Some((_, _, _, best_value)) = &sensory.richest_resource {
+                                if value > *best_value {
+                                    sensory.richest_resource = Some(entry);
+                                }
+                            } else {
+                                sensory.richest_resource = Some(entry);
+                            }
+
+                            sensory.nearby_resources.push(entry);
                         }
                     }
                 }
@@ -215,57 +251,88 @@ fn is_prey_of(
     is_predator_of(predator_type, prey_type, predator_size, prey_size)
 }
 
-/// Make behavior decision based on sensory data and organism state
-/// Returns the new behavior state and optional target
-pub fn decide_behavior(
+pub struct BehaviorDecision {
+    pub state: BehaviorState,
+    pub target_entity: Option<Entity>,
+    pub target_position: Option<Vec2>,
+    pub migration_target: Option<Vec2>,
+}
+
+pub fn decide_behavior_with_memory(
     energy: &Energy,
     cached_traits: &crate::organisms::components::CachedTraits,
     organism_type: OrganismType,
     sensory: &SensoryData,
     current_state: BehaviorState,
     state_time: f32,
-) -> (BehaviorState, Option<Entity>, Option<Vec2>) {
+    hunger_memory: f32,
+    threat_timer: f32,
+    recent_threat: Option<Vec2>,
+    has_migration_target: bool,
+) -> BehaviorDecision {
     // Priority system: Survival > Reproduction > Exploration
-
-    // 1. HIGHEST PRIORITY: Flee from predators (survival)
     let aggression = cached_traits.aggression;
     let boldness = cached_traits.boldness;
+    let risk_tolerance = cached_traits.risk_tolerance;
 
-    // Find nearest predator
-    let nearest_predator = sensory
-        .nearby_organisms
-        .iter()
-        .filter(|(_, _, _, is_pred, _, _)| *is_pred)
-        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    if let Some((entity, pred_pos, distance, _, _, _)) = nearest_predator {
-        // Flee if predator is close or if boldness is low
-        let flee_threshold = 10.0 + boldness * 20.0; // Bolder organisms flee later
-        if *distance < flee_threshold {
-            // Calculate flee direction (away from predator)
-            return (BehaviorState::Fleeing, Some(*entity), Some(*pred_pos));
+    if let Some((entity, pred_pos, distance)) = sensory.nearest_predator {
+        let flee_threshold = 8.0 + (boldness * 14.0) + (risk_tolerance * 6.0);
+        let memory_bonus = if threat_timer > 0.0 { 5.0 } else { 0.0 };
+        if distance < flee_threshold + memory_bonus {
+            return BehaviorDecision {
+                state: BehaviorState::Fleeing,
+                target_entity: Some(entity),
+                target_position: Some(pred_pos),
+                migration_target: None,
+            };
+        }
+    } else if threat_timer > 0.0 {
+        // Keep fleeing briefly even when predator left
+        if let Some(threat_pos) = recent_threat {
+            return BehaviorDecision {
+                state: BehaviorState::Fleeing,
+                target_entity: None,
+                target_position: Some(threat_pos),
+                migration_target: None,
+            };
         }
     }
 
-    // 2. SECOND PRIORITY: Eat if energy is low (survival)
-    let energy_threshold = 0.3; // Start seeking food below 30% energy
-    if energy.ratio() < energy_threshold {
-        // Find best food source
-        if let Some(best_food) = find_best_food_source(organism_type, sensory) {
-            if current_state == BehaviorState::Eating && state_time < 2.0 {
-                // Continue eating if we just started
-                return (BehaviorState::Eating, None, Some(best_food));
+    let hunger_pressure = ((1.0 - energy.ratio()).max(0.0) * 0.7) + (hunger_memory * 0.3);
+    let hunger_barrier = (0.3 - cached_traits.foraging_drive * 0.15).clamp(0.1, 0.5);
+
+    if hunger_pressure > hunger_barrier {
+        if let Some(best_food) = find_best_food_source_weighted(
+            organism_type,
+            sensory,
+            cached_traits.resource_selectivity,
+        ) {
+            if matches!(current_state, BehaviorState::Eating) && state_time < 2.0 {
+                return BehaviorDecision {
+                    state: BehaviorState::Eating,
+                    target_entity: None,
+                    target_position: Some(best_food),
+                    migration_target: None,
+                };
             }
-            return (BehaviorState::Chasing, None, Some(best_food));
+            return BehaviorDecision {
+                state: BehaviorState::Chasing,
+                target_entity: None,
+                target_position: Some(best_food),
+                migration_target: None,
+            };
         }
 
-        // Check if we're at a resource-rich cell
         if is_at_food_source(organism_type, sensory) {
-            return (BehaviorState::Eating, None, None);
+            return BehaviorDecision {
+                state: BehaviorState::Eating,
+                target_entity: None,
+                target_position: None,
+                migration_target: None,
+            };
         }
     }
 
-    // 3. THIRD PRIORITY: Chase prey (if aggressive and energy is decent)
     if organism_type == OrganismType::Consumer && energy.ratio() > 0.4 && aggression > 0.5 {
         if let Some((entity, prey_pos, distance, _, _is_prey, _)) = sensory
             .nearby_organisms
@@ -274,16 +341,23 @@ pub fn decide_behavior(
             .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
         {
             if *distance < 5.0 {
-                // Very close - start eating
-                return (BehaviorState::Eating, Some(*entity), Some(*prey_pos));
+                return BehaviorDecision {
+                    state: BehaviorState::Eating,
+                    target_entity: Some(*entity),
+                    target_position: Some(*prey_pos),
+                    migration_target: None,
+                };
             } else if *distance < 30.0 {
-                // Within chase range
-                return (BehaviorState::Chasing, Some(*entity), Some(*prey_pos));
+                return BehaviorDecision {
+                    state: BehaviorState::Chasing,
+                    target_entity: Some(*entity),
+                    target_position: Some(*prey_pos),
+                    migration_target: None,
+                };
             }
         }
     }
 
-    // 4. FOURTH PRIORITY: Mate if energy is high enough
     let reproduction_threshold = cached_traits.reproduction_threshold;
     if energy.ratio() >= reproduction_threshold {
         if let Some((entity, mate_pos, distance, _, _, _is_mate)) = sensory
@@ -293,23 +367,84 @@ pub fn decide_behavior(
             .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
         {
             if *distance < 15.0 {
-                // Within mating range
-                return (BehaviorState::Mating, Some(*entity), Some(*mate_pos));
+                return BehaviorDecision {
+                    state: BehaviorState::Mating,
+                    target_entity: Some(*entity),
+                    target_position: Some(*mate_pos),
+                    migration_target: None,
+                };
             }
         }
     }
 
-    // 5. FIFTH PRIORITY: Rest if energy is very low
     if energy.ratio() < 0.15 {
-        return (BehaviorState::Resting, None, None);
+        return BehaviorDecision {
+            state: BehaviorState::Resting,
+            target_entity: None,
+            target_position: None,
+            migration_target: None,
+        };
     }
 
-    // 6. DEFAULT: Wander
-    (BehaviorState::Wandering, None, None)
+    if !has_migration_target
+        && cached_traits.exploration_drive > 0.4
+        && sensory.nearby_resources.is_empty()
+    {
+        if let Some((target_pos, _, _, _)) = sensory.richest_resource {
+            return BehaviorDecision {
+                state: BehaviorState::Migrating,
+                target_entity: None,
+                target_position: None,
+                migration_target: Some(target_pos),
+            };
+        }
+    }
+
+    BehaviorDecision {
+        state: BehaviorState::Wandering,
+        target_entity: None,
+        target_position: None,
+        migration_target: None,
+    }
+}
+
+pub fn decide_behavior(
+    energy: &Energy,
+    cached_traits: &crate::organisms::components::CachedTraits,
+    organism_type: OrganismType,
+    sensory: &SensoryData,
+    current_state: BehaviorState,
+    state_time: f32,
+) -> (BehaviorState, Option<Entity>, Option<Vec2>) {
+    let decision = decide_behavior_with_memory(
+        energy,
+        cached_traits,
+        organism_type,
+        sensory,
+        current_state,
+        state_time,
+        0.0,
+        0.0,
+        None,
+        false,
+    );
+    (
+        decision.state,
+        decision.target_entity,
+        decision.target_position,
+    )
 }
 
 /// Find the best food source for an organism type
 fn find_best_food_source(organism_type: OrganismType, sensory: &SensoryData) -> Option<Vec2> {
+    find_best_food_source_weighted(organism_type, sensory, 0.0)
+}
+
+fn find_best_food_source_weighted(
+    organism_type: OrganismType,
+    sensory: &SensoryData,
+    selectivity: f32,
+) -> Option<Vec2> {
     let preferred_resources = match organism_type {
         OrganismType::Producer => vec![
             ResourceType::Sunlight,
@@ -320,21 +455,24 @@ fn find_best_food_source(organism_type: OrganismType, sensory: &SensoryData) -> 
         OrganismType::Decomposer => vec![ResourceType::Detritus],
     };
 
-    // Find closest resource of preferred type
-    for resource_type in preferred_resources {
-        if let Some((pos, _, _, value)) = sensory
-            .nearby_resources
-            .iter()
-            .find(|(_, rt, _, _)| *rt == resource_type)
-        {
-            if *value > 0.2 {
-                // Must have meaningful amount
-                return Some(*pos);
-            }
+    let mut best: Option<(Vec2, f32)> = None;
+    for (pos, resource_type, distance, value) in &sensory.nearby_resources {
+        if !preferred_resources.contains(resource_type) {
+            continue;
+        }
+
+        if *value <= 0.2 {
+            continue;
+        }
+
+        let score = value * (1.0 + selectivity) - distance * (0.1 + (1.0 - selectivity) * 0.05);
+        match &best {
+            Some((_, best_score)) if score <= *best_score => {}
+            _ => best = Some((*pos, score)),
         }
     }
 
-    None
+    best.map(|(pos, _)| pos)
 }
 
 /// Check if organism is at a food source
@@ -370,7 +508,8 @@ pub fn calculate_behavior_velocity(
 
     match behavior.state {
         BehaviorState::Fleeing => {
-            if let Some(flee_from) = behavior.target_position {
+            let source = behavior.target_position.or(behavior.recent_threat);
+            if let Some(flee_from) = source {
                 // Move away from threat
                 let direction = (position - flee_from).normalize_or_zero();
                 direction * current_speed * 1.5 // Flee faster
@@ -405,6 +544,16 @@ pub fn calculate_behavior_velocity(
         BehaviorState::Resting => {
             // Minimal movement
             Vec2::ZERO
+        }
+        BehaviorState::Migrating => {
+            if let Some(target) = behavior.migration_target.or(behavior.target_position) {
+                let direction = (target - position).normalize_or_zero();
+                direction * current_speed * 0.8
+            } else {
+                let angle = (time * 0.4 + (position.x * 0.3) + (position.y * 0.17)).cos()
+                    * std::f32::consts::TAU;
+                Vec2::from_angle(angle) * current_speed * 0.5
+            }
         }
         BehaviorState::Wandering => {
             // Random walk with occasional direction changes
