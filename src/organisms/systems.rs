@@ -77,7 +77,7 @@ impl Default for AllOrganismsLogger {
             csv_path,
             header_written: false,
             tick_counter: 0,
-            sample_interval: 25, // snapshot every 25 ticks by default
+            sample_interval: 50, // snapshot every 50 ticks by default
             flush_interval: 500, // flush every ~500 logged ticks
         }
     }

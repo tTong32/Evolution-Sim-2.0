@@ -113,6 +113,8 @@ fn regenerate_and_decay_resources(mut world_grid: ResMut<WorldGrid>, time: Res<T
 
 /// Flow resources between neighboring cells (simplified diffusion)
 /// OPTIMIZED: Uses direct array indexing instead of find() for O(1) access
+/// Flow resources between neighboring cells (simplified diffusion)
+/// OPTIMIZED: Uses flat Vec to avoid any stack allocations
 fn flow_resources(mut world_grid: ResMut<WorldGrid>, time: Res<Time>) {
     let dt = time.delta_seconds();
     let diffusion_rate = 0.1; // How quickly resources flow
@@ -125,24 +127,32 @@ fn flow_resources(mut world_grid: ResMut<WorldGrid>, time: Res<Time>) {
     for (chunk_x, chunk_y) in chunk_coords {
         if let Some(chunk) = world_grid.get_chunk_mut(chunk_x, chunk_y) {
             use crate::world::chunk::CHUNK_SIZE;
+            const RESOURCE_COUNT: usize = crate::world::cell::RESOURCE_TYPE_COUNT;
+            
+            // Use flat Vec to avoid any stack allocation issues
+            // Layout: [cell0_r0, cell0_r1, ..., cell0_r5, cell1_r0, ...]
+            let total_size = CHUNK_SIZE * CHUNK_SIZE * RESOURCE_COUNT;
+            let mut temp_resources = Vec::with_capacity(total_size);
+            temp_resources.resize(total_size, 0.0f32);
 
-            // Store current state for diffusion calculation (use 2D array for O(1) access)
-            let mut temp_resources = [[[0.0f32; 6]; CHUNK_SIZE]; CHUNK_SIZE];
-
-            // First pass: collect all cell resource data
+            // First pass: copy current resource densities into flat buffer
             for y in 0..CHUNK_SIZE {
                 for x in 0..CHUNK_SIZE {
                     if let Some(cell) = chunk.get_cell(x, y) {
-                        temp_resources[y][x] = cell.resource_density;
+                        let base_idx = (y * CHUNK_SIZE + x) * RESOURCE_COUNT;
+                        for i in 0..RESOURCE_COUNT {
+                            temp_resources[base_idx + i] = cell.resource_density[i];
+                        }
                     }
                 }
             }
 
-            // Second pass: apply diffusion using collected data
+            // Second pass: apply diffusion using the buffered data
             for y in 0..CHUNK_SIZE {
                 for x in 0..CHUNK_SIZE {
-                    // Calculate neighbor average using direct array access
-                    let mut neighbor_sum = [0.0f32; 6];
+                    let index = y * CHUNK_SIZE + x;
+                    let base_idx = index * RESOURCE_COUNT;
+                    let mut neighbor_sum = [0.0f32; RESOURCE_COUNT];
                     let mut neighbor_count = 0;
 
                     for dy in -1..=1 {
@@ -151,29 +161,31 @@ fn flow_resources(mut world_grid: ResMut<WorldGrid>, time: Res<Time>) {
                                 continue;
                             }
 
-                            let nx = (x as i32 + dx) as usize;
-                            let ny = (y as i32 + dy) as usize;
+                            let nx = x as isize + dx as isize;
+                            let ny = y as isize + dy as isize;
 
-                            if nx < CHUNK_SIZE && ny < CHUNK_SIZE {
-                                // Direct array access - O(1) instead of O(n)
-                                for i in 0..6 {
-                                    neighbor_sum[i] += temp_resources[ny][nx][i];
+                            if nx >= 0
+                                && nx < CHUNK_SIZE as isize
+                                && ny >= 0
+                                && ny < CHUNK_SIZE as isize
+                            {
+                                let n_index = (ny as usize * CHUNK_SIZE + nx as usize) * RESOURCE_COUNT;
+                                for i in 0..RESOURCE_COUNT {
+                                    neighbor_sum[i] += temp_resources[n_index + i];
                                 }
                                 neighbor_count += 1;
                             }
                         }
                     }
 
-                    // Now update the cell
-                    if let Some(cell) = chunk.get_cell_mut(x, y) {
-                        if neighbor_count > 0 {
-                            let old_resources = temp_resources[y][x];
-                            for i in 0..6 {
+                    if neighbor_count > 0 {
+                        if let Some(cell) = chunk.get_cell_mut(x, y) {
+                            for i in 0..RESOURCE_COUNT {
+                                let old_value = temp_resources[base_idx + i];
                                 let neighbor_avg = neighbor_sum[i] / neighbor_count as f32;
-                                let diff = neighbor_avg - old_resources[i];
-                                cell.resource_density[i] += diff * diffusion_rate * dt;
+                                let diff = neighbor_avg - old_value;
                                 cell.resource_density[i] =
-                                    cell.resource_density[i].max(0.0).min(1.0);
+                                    (old_value + diff * diffusion_rate * dt).clamp(0.0, 1.0);
                             }
                         }
                     }

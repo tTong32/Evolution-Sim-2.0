@@ -5,11 +5,11 @@ pub const CHUNK_SIZE: usize = 64;
 
 /// A chunk represents a fixed-size region of the world
 /// Chunks are stored sparsely (only active chunks exist in memory)
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Chunk {
-    /// The cells in this chunk, stored as a flat array
+    /// The cells in this chunk, stored as a boxed array to avoid stack overflow
     /// Access: cells[y * CHUNK_SIZE + x]
-    cells: [Cell; CHUNK_SIZE * CHUNK_SIZE],
+    cells: Box<[Cell; CHUNK_SIZE * CHUNK_SIZE]>,
     /// Chunk coordinates in chunk-space (not world-space)
     pub chunk_x: i32,
     pub chunk_y: i32,
@@ -23,8 +23,10 @@ pub struct Chunk {
 impl Chunk {
     /// Create a new chunk at the specified chunk coordinates
     pub fn new(chunk_x: i32, chunk_y: i32) -> Self {
+        // Use Box::new to allocate on heap instead of stack to avoid stack overflow
+        let cells = Box::new([Cell::new(); CHUNK_SIZE * CHUNK_SIZE]);
         Self {
-            cells: [Cell::new(); CHUNK_SIZE * CHUNK_SIZE],
+            cells,
             chunk_x,
             chunk_y,
             dirty: false,
