@@ -4,7 +4,7 @@ A modular, open-ended simulation of biological evolution and ecosystems featurin
 
 ## 🚀 Current Status
 
-**Steps 1-7: Core Systems** ✅ **COMPLETE**
+**Steps 1-8: Core Systems + Ecosystem Tuning** ✅ **IN PROGRESS**
 
 The simulation now includes:
 - ✅ **Step 1: Core Framework** - Project structure, Bevy ECS, world grid, chunks, cells
@@ -14,6 +14,11 @@ The simulation now includes:
 - ✅ **Step 5: Behavior System** - State machine, decision-making, sensory data, memory
 - ✅ **Step 6: Resource-Organism Interaction** - Eating, metabolism, energy flow
 - ✅ **Step 7: Visualization & Logging** - Real-time rendering, CSV logging, camera controls
+- 🔄 **Step 8: Emergent Ecosystem Tuning** - IN PROGRESS
+  - ✅ Speciation system - tracks and differentiates species based on genetic distance
+  - ✅ Tuning parameters - centralized ecosystem balance configuration
+  - ✅ Ecosystem statistics - population and trait tracking
+  - ✅ Species assignment during spawning and reproduction
 
 ## 📁 Project Structure
 
@@ -35,7 +40,10 @@ evolution-sim/
 │   │   ├── components.rs   # Organism components
 │   │   ├── genetics.rs     # Genome and trait expression
 │   │   ├── behavior.rs     # Behavior system and decision-making
-│   │   └── systems.rs      # Organism update systems
+│   │   ├── systems.rs      # Organism update systems
+│   │   ├── speciation.rs   # Species tracking and differentiation (Step 8)
+│   │   ├── tuning.rs       # Ecosystem tuning parameters (Step 8)
+│   │   └── ecosystem_stats.rs # Ecosystem statistics (Step 8)
 │   ├── visualization/      # Visualization module
 │   │   ├── mod.rs          # Visualization plugin
 │   │   ├── organisms.rs    # Organism sprite rendering
@@ -115,9 +123,15 @@ Following the development timeline:
 5. ✅ **Behavior System** - Complete
 6. ✅ **Resource-Organism Interaction** - Complete
 7. ✅ **Visualization & Logging** - Complete
-8. ⏭️ **Emergent Ecosystem Tuning** - Tune rates until emergent biomes form
-9. ⏭️ **Advanced Systems** - Add speciation, climate events, disease, co-evolution
-10. ⏭️ **Performance Scaling** - Parallelize updates, optimize data layout
+8. 🔄 **Emergent Ecosystem Tuning** - IN PROGRESS
+   - ✅ Speciation system implemented
+   - ✅ Tuning parameters resource created
+   - ✅ Ecosystem statistics collection
+   - ⏭️ Balance resource regeneration/consumption
+   - ⏭️ Tune reproduction rates for stability
+   - ⏭️ Improve behavior differentiation
+9. ⏭️ **Advanced Systems** - Add climate events, disease, co-evolution
+10. ⏭️ **Performance Scaling** - Additional parallelization (partial optimization complete)
 
 ## 📚 Documentation
 

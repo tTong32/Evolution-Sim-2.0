@@ -167,10 +167,12 @@ fn update_chunks(
 
 /// Regenerate and decay resources in all chunks
 /// OPTIMIZED: Sparse updates - only process cells with resources or near organisms
+/// Step 8: Uses tuning parameters for ecosystem balance
 fn regenerate_and_decay_resources(
     mut world_grid: ResMut<WorldGrid>, 
     time: Res<Time>,
     dirty_chunks: Res<DirtyChunks>,
+    tuning: Option<Res<crate::organisms::EcosystemTuning>>, // Step 8: Optional tuning
 ) {
     let dt = time.delta_seconds();
     let chunk_coords: Vec<_> = world_grid.get_chunk_coords();

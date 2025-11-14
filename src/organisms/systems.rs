@@ -108,16 +108,18 @@ impl AllOrganismsLogger {
     }
 }
 
-/// Spawn initial organisms in the world
+/// Spawn initial organisms in the world (Step 8: Uses tuning parameters)
 pub fn spawn_initial_organisms(
     mut commands: Commands,
     mut tracked: ResMut<TrackedOrganism>,
+    mut species_tracker: ResMut<crate::organisms::speciation::SpeciesTracker>, // Step 8: Speciation
+    tuning: Res<crate::organisms::EcosystemTuning>, // Step 8: Tuning parameters
     _world_grid: Res<WorldGrid>,
 ) {
     info!("Spawning initial organisms...");
 
     let mut rng = fastrand::Rng::new();
-    let spawn_count = 100; // Start with 100 organisms
+    let spawn_count = tuning.initial_spawn_count;
 
     // Spawn organisms randomly within initialized chunks
     // Chunks are from -1 to 1, each chunk is 64x64 cells
@@ -151,6 +153,9 @@ pub fn spawn_initial_organisms(
         let vel_y = rng.f32() * 20.0 - 10.0;
 
         let cached_traits = CachedTraits::from_genome(&genome);
+        
+        // Step 8: Assign species ID using speciation system
+        let species_id = species_tracker.find_or_create_species(&genome);
 
         let entity = commands
             .spawn((
@@ -163,7 +168,7 @@ pub fn spawn_initial_organisms(
                 ReproductionCooldown::new(reproduction_cooldown),
                 genome,
                 cached_traits,
-                SpeciesId::new(0), // All start as same species for now
+                species_id, // Step 8: Use speciation-assigned species ID
                 organism_type,
                 Behavior::new(),
                 Alive,
@@ -462,7 +467,7 @@ pub fn update_movement(
     }
 }
 
-/// Handle eating behavior - consume resources or prey
+/// Handle eating behavior - consume resources or prey (Step 8: Uses tuning parameters)
 pub fn handle_eating(
     mut query: Query<
         (
@@ -476,12 +481,13 @@ pub fn handle_eating(
         With<Alive>,
     >,
     mut world_grid: ResMut<WorldGrid>,
+    tuning: Res<crate::organisms::EcosystemTuning>, // Step 8: Tuning parameters
     _organism_query: Query<(&Position, &mut Energy, &Size), (With<Alive>, Without<Behavior>)>,
     time: Res<Time>,
 ) {
     let dt = time.delta_seconds();
-    let consumption_rate = 5.0; // Resources consumed per second
-    let energy_conversion_efficiency = 0.3; // 30% of consumed resources -> energy
+    let consumption_rate = tuning.consumption_rate_base;
+    let energy_conversion_efficiency = tuning.energy_conversion_efficiency;
 
     for (_entity, position, mut energy, behavior, organism_type, _size) in query.iter_mut() {
         if behavior.state != BehaviorState::Eating {
@@ -556,7 +562,8 @@ pub fn handle_eating(
                     );
                     cell.add_pressure(ResourceType::Detritus, detritus);
 
-                    detritus * energy_conversion_efficiency * 0.5 // Less efficient
+                    // Step 8: Use tuning parameter for decomposer efficiency
+                    detritus * energy_conversion_efficiency * tuning.decomposer_efficiency_multiplier
                 }
             };
 
@@ -575,7 +582,7 @@ pub fn update_age(mut query: Query<(&mut Age, &mut ReproductionCooldown)>) {
     }
 }
 
-/// Handle reproduction - both asexual and sexual
+/// Handle reproduction - both asexual and sexual (Step 8: Uses speciation system)
 pub fn handle_reproduction(
     mut commands: Commands,
     mut query: Query<
@@ -591,6 +598,8 @@ pub fn handle_reproduction(
         ),
         With<Alive>,
     >,
+    mut species_tracker: ResMut<crate::organisms::speciation::SpeciesTracker>, // Step 8: Speciation
+    tuning: Res<crate::organisms::EcosystemTuning>, // Step 8: Tuning parameters
     spatial_hash: Res<SpatialHashGrid>,
     organism_query: Query<(Entity, &Position, &Genome, &SpeciesId, &CachedTraits), With<Alive>>,
 ) {
@@ -617,8 +626,9 @@ pub fn handle_reproduction(
             continue;
         }
 
-        if rng.f32() >= 0.1 {
-            continue; // 10% chance per frame when conditions are met
+        // Use tuning parameter for reproduction chance
+        if rng.f32() >= tuning.reproduction_chance_multiplier {
+            continue;
         }
 
         let clutch_size = cached_traits.clutch_size.max(1.0).round().clamp(1.0, 6.0) as usize;
@@ -699,6 +709,7 @@ pub fn handle_reproduction(
             let total_energy_cost = per_child_energy * count;
             parent_energy.current = (available_energy - total_energy_cost).max(0.0);
 
+            let mut spawned_species = None;
             for offspring_genome in event.genomes {
                 let cached = CachedTraits::from_genome(&offspring_genome);
                 let size = cached.size;
@@ -712,6 +723,12 @@ pub fn handle_reproduction(
                     .min(max_energy)
                     .max(max_energy * 0.15);
 
+                // Step 8: Assign species ID using speciation system
+                let offspring_species = species_tracker.find_or_create_species(&offspring_genome);
+                if spawned_species.is_none() {
+                    spawned_species = Some(offspring_species);
+                }
+                
                 commands.spawn((
                     Position::new(event.position.x + offset.x, event.position.y + offset.y),
                     Velocity::new(0.0, 0.0),
@@ -722,7 +739,7 @@ pub fn handle_reproduction(
                     ReproductionCooldown::new(reproduction_cooldown),
                     offspring_genome,
                     cached,
-                    event.species_id,
+                    offspring_species, // Step 8: Use speciation-assigned species ID
                     event.organism_type,
                     Behavior::new(),
                     Alive,
@@ -730,10 +747,20 @@ pub fn handle_reproduction(
             }
 
             parent_cooldown.reset(parent_traits.reproduction_cooldown.max(1.0) as u32);
-            info!(
-                "Organism reproduced! Spawned {} offspring near parent",
-                count as u32
-            );
+            
+            // Step 8: Log species information on reproduction
+            if let Some(species) = spawned_species {
+                let species_count = species_tracker.species_count();
+                if count as u32 % 10 == 0 || species_count <= 5 {
+                    // Log every 10th reproduction or when few species exist
+                    info!(
+                        "[REPRODUCTION] Spawned {} offspring | Species: {} (parent: {})",
+                        count as u32,
+                        species_count,
+                        species.value()
+                    );
+                }
+            }
         }
     }
 }

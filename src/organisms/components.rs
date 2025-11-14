@@ -146,7 +146,7 @@ impl SpeciesId {
 pub struct Alive;
 
 /// Organism type (for future behavior differentiation)
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OrganismType {
     Producer,   // Plants, algae - generate energy from resources
     Consumer,   // Animals - consume other organisms/resources
